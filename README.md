@@ -114,6 +114,27 @@ bind = SUPER SHIFT, I, exec, uwsm app -- xdg-terminal-exec --app-id=TUI.float -e
 
 Reload with `hyprctl reload` (or just log out and back in).
 
+### Window sizing
+
+`{ tui = ... }` launches through `omarchy-launch-tui`, which gives the window the
+app-id `org.omarchy.omarchy-ipscan`. That app-id is not in Omarchy's stock
+floating list, so it tiles by default. To float it at a size that fits the
+side-by-side detail pane, add this to `~/.config/hypr/hyprland.lua`:
+
+```lua
+o.window("org\\.omarchy\\.omarchy-ipscan", { float = true })
+o.window("org\\.omarchy\\.omarchy-ipscan", { center = true })
+o.window("org\\.omarchy\\.omarchy-ipscan", { size = { 1300, 800 } })
+```
+
+Omarchy's stock `TUI.float` popup is 875x600, which measured 83 columns here —
+below the 100-column threshold, so the detail pane would stack under the list
+instead of sitting beside it. 1300x800 measures 125x34. Adjust to taste; the
+picker adapts to whatever it is given.
+
+`install.sh` points the desktop entry at the same `omarchy-launch-tui` command,
+so the app launcher and the keybind open an identical window.
+
 ## Design notes
 
 **Vendors come from nmap, not arp-scan.** `arp-scan`'s bundled `ieee-oui.txt` is

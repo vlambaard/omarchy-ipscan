@@ -193,6 +193,21 @@ cleanup() {
 
 on_interrupt() { warn ""; warn "interrupted"; exit 130; }
 
+# Runs an interactive gum prompt, capturing stdout to $out. The prompt is
+# backgrounded and waited on for the same reason the scan stages are: bash
+# defers trap handling while a FOREGROUND child runs, so closing the terminal
+# at a prompt would otherwise leave the scratch dir and the gum process behind.
+# Job control is off in a script, so the background child stays in this process
+# group and can still read the terminal.
+run_gum() {
+  local out=$1; shift
+  local pid rc=0
+  "$@" >"$out" &
+  pid=$!
+  wait "$pid" || rc=$?
+  return "$rc"
+}
+
 # ------------------------------------------------------------------ networking
 # Only the default-route interface is considered. Enumerating every address
 # would pick up docker/bridge networks, which are never what you meant.
@@ -697,7 +712,8 @@ do_scan() {
 interactive_export() {
   local fmt file default
   if have gum; then
-    fmt=$(gum choose --header="export format" CSV JSON) || return 0
+    run_gum "$TMP/fmt" gum choose --header="export format" CSV JSON || return 0
+    fmt=$(<"$TMP/fmt")
   else
     read -r -p "format [csv/json]: " fmt || return 0
   fi
@@ -705,7 +721,8 @@ interactive_export() {
   fmt=${fmt,,}
   default="ipscan-$(date +%Y%m%d-%H%M%S).${fmt}"
   if have gum; then
-    file=$(gum input --prompt "file ▸ " --value "$default") || return 0
+    run_gum "$TMP/file" gum input --prompt "file ▸ " --value "$default" || return 0
+    file=$(<"$TMP/file")
   else
     read -r -p "file [$default]: " file || return 0
   fi
@@ -763,9 +780,10 @@ main() {
       [[ -n ${DETECTED_CIDR:-} ]] || die "cannot auto-detect a subnet; pass a target"
       TARGET=$DETECTED_CIDR
     else
-      TARGET=$(gum input --prompt 'target ▸ ' \
-                 --value "${DETECTED_CIDR:-192.168.1.0/24}" \
-                 --placeholder 'CIDR, range, IP or hostname') || exit 130
+      run_gum "$TMP/target" gum input --prompt 'target ▸ ' \
+        --value "${DETECTED_CIDR:-192.168.1.0/24}" \
+        --placeholder 'CIDR, range, IP or hostname' || exit 130
+      TARGET=$(<"$TMP/target")
       [[ -z $TARGET ]] && exit 130
     fi
   fi

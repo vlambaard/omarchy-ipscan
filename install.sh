@@ -6,6 +6,7 @@ SRC_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BIN_DIR=${BIN_DIR:-$HOME/.local/bin}
 APP_DIR=${APP_DIR:-$HOME/.local/share/applications}
 NAME=omarchy-ipscan
+exec_line=
 
 B=$'\033[1m'; D=$'\033[2m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[0m'
 ok()   { printf '  %s✓%s %s\n' "$G" "$R" "$*"; }
@@ -22,7 +23,17 @@ ok "linked $BIN_DIR/$NAME -> $SRC_DIR/$NAME"
 # The .desktop file must point at an absolute path, so it is generated from the
 # template with the real install location substituted in.
 if [[ -f $SRC_DIR/$NAME.desktop ]]; then
-  sed "s|@BIN@|$BIN_DIR/$NAME|g" "$SRC_DIR/$NAME.desktop" >"$APP_DIR/$NAME.desktop"
+  # Prefer Omarchy's TUI launcher so the app-launcher entry and the Hyprland
+  # keybind open the very same window; fall back to a bare terminal elsewhere.
+  if command -v omarchy-launch-tui >/dev/null 2>&1; then
+    exec_line="omarchy-launch-tui $NAME"
+  elif command -v xdg-terminal-exec >/dev/null 2>&1; then
+    exec_line="xdg-terminal-exec -e $BIN_DIR/$NAME"
+  else
+    exec_line="$BIN_DIR/$NAME"
+  fi
+  sed -e "s|@BIN@|$BIN_DIR/$NAME|g" -e "s|@EXEC@|$exec_line|g" \
+      "$SRC_DIR/$NAME.desktop" >"$APP_DIR/$NAME.desktop"
   ok "installed $APP_DIR/$NAME.desktop"
   command -v update-desktop-database >/dev/null 2>&1 \
     && update-desktop-database "$APP_DIR" >/dev/null 2>&1 \

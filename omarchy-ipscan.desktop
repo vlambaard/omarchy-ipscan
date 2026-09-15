@@ -4,10 +4,11 @@ Type=Application
 Name=IP Scanner
 GenericName=Network Scanner
 Comment=Sweep the local subnet and browse live hosts
-# Launched through Omarchy's terminal helper rather than Terminal=true so the
-# window picks up the TUI.float app-id and the theme's terminal styling.
-# @BIN@ is replaced with the real install path by install.sh.
-Exec=xdg-terminal-exec --app-id=TUI.float -e @BIN@
+# @EXEC@ is filled in by install.sh: on Omarchy it becomes omarchy-launch-tui,
+# the same launcher the Hyprland keybind uses, so both routes produce an
+# identical window (app-id org.omarchy.omarchy-ipscan) that the float/size rule
+# in hyprland.lua targets. Elsewhere it falls back to a plain terminal.
+Exec=@EXEC@
 Terminal=false
 Icon=network-workgroup
 Categories=Network;ConsoleOnly;
