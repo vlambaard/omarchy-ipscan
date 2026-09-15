@@ -7,22 +7,11 @@ It sweeps a subnet with `nmap`, enriches the results with MAC addresses and hard
 vendors, and drops you into an `fzf` picker where you can ssh into a host, copy its
 address, open it in a browser, or port-scan it. No GUI, no daemon, and **no root**.
 
-```
-╭ 󰛳 omarchy-ipscan ───────────────────────────────────────────────────────────╮
-│   192.168.10.0/24 · wlp11s0 · 6 up/256 · 2s      │                          │
-│ filter ▸                                         │   󰑩 192.168.10.1         │
-│   6/6 (0) ────────────────────────────────────── │   ───────────────────    │
-│ ▸ 󰑩 192.168.10.1     _gateway             4ms    │   host    _gateway       │
-│ ▌ 󰄜 192.168.10.149   (randomized)        69ms    │   mac     d4:01:c3:aa:.. │
-│ ▌ 󰌢 192.168.10.173   workstation         <1ms    │   vendor  Routerboard    │
-│ ▌ 󰐪 192.168.10.178   Canon               22ms    │   type    router         │
-│ ▌ 󰍹 192.168.10.223   Guangzhou Shiyuan    4ms    │   rtt     4ms            │
-│                                                  │   source  nmap+arp       │
-│                                                  │   ports   ^p to probe    │
-│ ─────────────────────────────────────────────────│                          │
-│   ↵ ssh  ^y copy  ^o http  ^p ports  ^r rescan   │                          │
-╰──────────────────────────────────────────────────┴──────────────────────────╯
-```
+![omarchy-ipscan scanning a /24, with the detail pane showing a selected host](docs/screenshot.png)
+
+<sub>Example data. Device-specific MAC octets are placeholders; the OUI prefixes are
+genuine vendor registrations, so the vendor column shows what a real scan would.</sub>
+
 
 ## Why
 
