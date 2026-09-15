@@ -34,7 +34,7 @@ it, grabbing its IP, or checking what it has open is. Typical uses:
 
 ## Features
 
-- Targets by CIDR (`192.168.10.0/24`), range (`192.168.10.1-50`), single IP, or
+- Targets by CIDR (`192.168.1.0/24`), range (`192.168.1.1-50`), single IP, or
   hostname — or auto-detects your subnet from the default route.
 - MAC address and hardware vendor per host, without root.
 - Reverse DNS for every host, resolved in parallel.
@@ -112,9 +112,9 @@ rm ~/.local/bin/omarchy-ipscan ~/.local/share/applications/omarchy-ipscan.deskto
 
 ```bash
 omarchy-ipscan                            # auto-detect the subnet, confirm, browse
-omarchy-ipscan 192.168.10.0/24            # CIDR
-omarchy-ipscan 192.168.10.1-50            # hyphen range
-omarchy-ipscan 192.168.10.1               # single host
+omarchy-ipscan 192.168.1.0/24             # CIDR
+omarchy-ipscan 192.168.1.1-50             # hyphen range
+omarchy-ipscan 192.168.1.1                # single host
 omarchy-ipscan nas.local                  # hostname (resolved first)
 omarchy-ipscan --csv hosts.csv            # headless export
 omarchy-ipscan -q | awk -F'\t' '$2!="-"'  # only hosts with a reverse-DNS name
@@ -159,14 +159,14 @@ deliberately ignored.
 `--quiet` is tab-separated with `-` for unknown fields:
 
 ```
-192.168.10.1	_gateway	d4:01:c3:aa:bb:cc
-192.168.10.178	-	50:03:cf:aa:bb:cc
+192.168.1.1	_gateway	d4:01:c3:aa:bb:cc
+192.168.1.178	-	50:03:cf:aa:bb:cc
 ```
 
 `--json` emits `null` rather than a placeholder, so it parses cleanly:
 
 ```json
-[{ "ip": "192.168.10.178", "hostname": null, "mac": "50:03:cf:aa:bb:cc",
+[{ "ip": "192.168.1.178", "hostname": null, "mac": "50:03:cf:aa:bb:cc",
    "vendor": "Canon", "latency_ms": 22.0, "type": "printer", "sources": "nmap+arp" }]
 ```
 
