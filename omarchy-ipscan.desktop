@@ -1,0 +1,15 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=IP Scanner
+GenericName=Network Scanner
+Comment=Sweep the local subnet and browse live hosts
+# Launched through Omarchy's terminal helper rather than Terminal=true so the
+# window picks up the TUI.float app-id and the theme's terminal styling.
+# @BIN@ is replaced with the real install path by install.sh.
+Exec=xdg-terminal-exec --app-id=TUI.float -e @BIN@
+Terminal=false
+Icon=network-workgroup
+Categories=Network;ConsoleOnly;
+Keywords=network;scan;ip;lan;subnet;hosts;nmap;arp;discovery;
+StartupNotify=true

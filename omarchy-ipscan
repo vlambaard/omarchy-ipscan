@@ -1,0 +1,821 @@
+#!/usr/bin/env bash
+# omarchy-ipscan - terminal-native network scanner for Omarchy.
+# An Angry IP Scanner replacement: sweeps a subnet with nmap/arp-scan and
+# presents live hosts in an fzf picker. No GUI, no root.
+set -euo pipefail
+
+VERSION=1.0.0
+PROGNAME=${0##*/}
+
+# ---------------------------------------------------------------- environment
+have() { command -v "$1" >/dev/null 2>&1; }
+
+OUI_DB=/usr/share/nmap/nmap-mac-prefixes
+JOBS=64                       # bounded parallelism for reverse DNS
+TOP_PORTS=20                  # nmap --top-ports for the on-demand probe
+
+TARGET=""; IFACE=""; CSV_OUT=""; JSON_OUT=""
+QUIET=0; USE_ICONS=auto; DO_PORTS=0
+
+# ------------------------------------------------------------------ appearance
+# Theme-aware: ANSI 0-15 only, never hex. Omarchy themes recolour the terminal,
+# so we inherit whatever the active theme defines.
+setup_colors() {
+  if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+    B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
+    C=$'\033[36m'; G=$'\033[32m'; Y=$'\033[33m'; RD=$'\033[31m'
+  else
+    B=""; D=""; R=""; C=""; G=""; Y=""; RD=""
+  fi
+}
+
+# Icons come from a single Nerd Font range (nf-md, U+F0000-U+F1AF0) so every
+# glyph has identical display width - mixing ranges breaks column alignment.
+ICO_ROUTER=$'\U000F0469'; ICO_PHONE=$'\U000F011C'; ICO_HOST=$'\U000F01C4'
+ICO_LAPTOP=$'\U000F0322'; ICO_PRINTER=$'\U000F042A'; ICO_SCREEN=$'\U000F0379'
+ICO_SERVER=$'\U000F048B'; ICO_APP=$'\U000F06F3'
+
+have_nerdfont() {
+  [[ $USE_ICONS == off ]] && return 1
+  [[ $USE_ICONS == on  ]] && return 0
+  have fc-list || return 1
+  # Deliberately grep -c, not -q: -q exits on the first match, fc-list then dies
+  # of SIGPIPE, and `set -o pipefail` turns that into a failed detection.
+  local n
+  n=$(fc-list 2>/dev/null | grep -ciE 'nerd font|nerdfont' || true)
+  [[ ${n:-0} -gt 0 ]]
+}
+
+icon_for() {
+  ((ICONS)) || { printf ''; return; }
+  case $1 in
+    router)  printf '%s' "$ICO_ROUTER"  ;; printer) printf '%s' "$ICO_PRINTER" ;;
+    phone)   printf '%s' "$ICO_PHONE"   ;; display) printf '%s' "$ICO_SCREEN"  ;;
+    self)    printf '%s' "$ICO_LAPTOP"  ;; server)  printf '%s' "$ICO_SERVER"  ;;
+    *)       printf '%s' "$ICO_HOST"    ;;
+  esac
+}
+
+# Infer a device class from the hardware vendor. Best-effort only; shown as
+# "(inferred)" in the detail pane so it is never mistaken for ground truth.
+type_for() {
+  local vendor=$1 mac=$2 ip=$3
+  [[ $ip == "$SELF_IP" ]] && { printf 'self'; return; }
+  shopt -s nocasematch
+  local t=host
+  case $vendor in
+    *routerboard*|*mikrotik*|*ubiquiti*|*tp-link*|*netgear*|*asus*|*cisco*|\
+    *zyxel*|*d-link*|*draytek*|*fritz*|*openwrt*|*aruba*|*ruckus*) t=router ;;
+    *canon*|*epson*|*brother*|*hewlett*|*lexmark*|*kyocera*|*ricoh*|*xerox*) t=printer ;;
+    *synology*|*qnap*|*western\ digital*|*seagate*|*supermicro*|*dell*) t=server ;;
+    *shiyuan*|*roku*|*chromecast*|*vizio*|*hisense*|*tcl*|*sony*|*lg\ elec*) t=display ;;
+    *apple*|*samsung*|*xiaomi*|*oneplus*|*oppo*|*vivo*|*motorola*|*nothing*) t=phone ;;
+    *espressif*|*tuya*|*sonoff*|*shelly*|*signify*|*philips*|*tasmota*) t=server ;;
+  esac
+  shopt -u nocasematch
+  [[ $t == host && $vendor == "(randomized)" ]] && t=phone
+  [[ $t == host && $mac == "-" ]] && t=host
+  printf '%s' "$t"
+}
+
+# ----------------------------------------------------------------------- usage
+usage() {
+  cat <<HELP_EOF
+${PROGNAME} ${VERSION} - terminal network scanner for Omarchy
+
+USAGE
+  ${PROGNAME} [TARGET] [OPTIONS]
+
+TARGET
+  CIDR              192.168.10.0/24
+  hyphen range      192.168.10.1-50
+  single host       192.168.10.1
+  hostname          nas.local
+  (omitted)         auto-detected from the default route, offered as a prompt
+
+OPTIONS
+  -i, --iface IF    force the interface used for ARP discovery
+      --csv FILE    write results to FILE as CSV and exit
+      --json FILE   write results to FILE as JSON and exit
+  -p, --ports       port-probe every live host after the sweep
+  -q, --quiet       print "IP<TAB>hostname<TAB>MAC" and exit (pipe-friendly;
+                    also the automatic behaviour when stdout is not a TTY)
+      --icons on|off|auto   device glyphs (default: auto-detect a Nerd Font)
+      --no-icons    alias for --icons off
+  -h, --help        this text
+  -V, --version     print version
+
+PICKER KEYBINDS
+  enter     ssh to the highlighted host
+  ctrl-y    copy selected IP(s) to the clipboard
+  ctrl-o    open http://<ip> in the browser
+  ctrl-p    port-scan the highlighted host (top ${TOP_PORTS} ports)
+  ctrl-r    rescan the same target
+  ctrl-e    export results to CSV or JSON
+  tab       multi-select     esc  quit
+
+ENGINES
+  nmap      host discovery (unprivileged -sn sweep)
+  arp-scan  MAC addresses on the local subnet; needs cap_net_raw, skipped if absent
+  fping     fallback sweep when nmap is missing
+  Vendors are resolved from nmap's OUI database (${OUI_DB}).
+
+EXAMPLES
+  ${PROGNAME}                          # auto-detect, prompt, browse
+  ${PROGNAME} 192.168.10.0/24          # scan and browse
+  ${PROGNAME} 10.0.0.1-50 --csv o.csv  # headless export
+  ${PROGNAME} -q | awk '\$2!="-"'       # pipe to other tools
+HELP_EOF
+}
+
+# ------------------------------------------------------------------- arguments
+parse_args() {
+  while (($#)); do
+    case $1 in
+      -h|--help)    usage; exit 0 ;;
+      -V|--version) printf '%s %s\n' "$PROGNAME" "$VERSION"; exit 0 ;;
+      -q|--quiet)   QUIET=1 ;;
+      -p|--ports)   DO_PORTS=1 ;;
+      --no-icons)   USE_ICONS=off ;;
+      --icons)      USE_ICONS=${2:?--icons needs on|off|auto}; shift ;;
+      --icons=*)    USE_ICONS=${1#*=} ;;
+      -i|--iface)   IFACE=${2:?--iface needs an interface}; shift ;;
+      --iface=*)    IFACE=${1#*=} ;;
+      --csv)        CSV_OUT=${2:?--csv needs a file}; shift ;;
+      --csv=*)      CSV_OUT=${1#*=} ;;
+      --json)       JSON_OUT=${2:?--json needs a file}; shift ;;
+      --json=*)     JSON_OUT=${1#*=} ;;
+      --)           shift; [[ $# -gt 0 ]] && TARGET=$1; break ;;
+      -*)           die "unknown option: $1 (try --help)" ;;
+      *)            TARGET=$1 ;;
+    esac
+    shift
+  done
+  case $USE_ICONS in on|off|auto) ;; *) die "--icons must be on, off or auto" ;; esac
+}
+
+die()  { printf '%s%s:%s %s\n' "${RD:-}" "$PROGNAME" "${R:-}" "$*" >&2; exit 1; }
+warn() { ((QUIET)) || printf '%s%s%s\n' "${D:-}" "$*" "${R:-}" >&2; }
+
+# --------------------------------------------------------------- scratch space
+# Every temporary file lives under one directory; the trap removes it and
+# reaps any nmap/arp-scan children so Ctrl-C never leaks processes.
+setup_tmp() {
+  TMP=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-ipscan.XXXXXXXX")
+  trap cleanup EXIT
+  # HUP matters as much as INT here: closing the terminal window mid-scan would
+  # otherwise skip the EXIT trap and leave the scratch directory behind.
+  trap 'on_interrupt' INT TERM HUP QUIT
+}
+
+# Kills a process and everything below it. pkill -P only reaches direct
+# children, which would strand the nmap that `gum spin` started.
+kill_tree() {
+  local pid=$1 child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$child"; done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+cleanup() {
+  local code=$?
+  trap - EXIT INT TERM HUP QUIT
+  local child
+  for child in $(pgrep -P $$ 2>/dev/null); do kill_tree "$child"; done
+  if [[ -n ${OIPS_KEEP:-} && -n ${TMP:-} ]]; then
+    printf 'kept scratch dir: %s\n' "$TMP" >&2
+  elif [[ -n ${TMP:-} && -d ${TMP:-} ]]; then
+    rm -rf -- "$TMP"
+  fi
+  # restore the cursor in case a spinner or fzf was interrupted mid-draw
+  [[ -t 1 ]] && printf '\033[?25h'
+  exit "$code"
+}
+
+on_interrupt() { warn ""; warn "interrupted"; exit 130; }
+
+# ------------------------------------------------------------------ networking
+# Only the default-route interface is considered. Enumerating every address
+# would pick up docker/bridge networks, which are never what you meant.
+# Sets DETECTED_CIDR, SELF_IP and IFACE as globals. Deliberately not written to
+# print its result: running it in a $( ) subshell would discard the two globals.
+detect_default() {
+  local line dev src
+  DETECTED_CIDR=""
+  line=$(ip -4 route show default 2>/dev/null | head -1) || true
+  [[ -z $line ]] && return 1
+  dev=$(awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' <<<"$line" | head -1 || true)
+  [[ -z $dev ]] && return 1
+  [[ -z $IFACE ]] && IFACE=$dev
+  src=$(ip -4 -o addr show dev "$dev" scope global 2>/dev/null \
+        | awk '{print $4}' | head -1)
+  [[ -z $src ]] && return 1
+  SELF_IP=${src%%/*}
+  # normalise host address to the network address: 192.168.10.173/24 -> .0/24
+  local ipp=${src%%/*} bits=${src##*/}
+  IFS=. read -r a b c _ <<<"$ipp"
+  case $bits in
+    24) DETECTED_CIDR=$(printf '%d.%d.%d.0/24' "$a" "$b" "$c") ;;
+    16) DETECTED_CIDR=$(printf '%d.%d.0.0/16'  "$a" "$b")      ;;
+     8) DETECTED_CIDR=$(printf '%d.0.0.0/8'    "$a")           ;;
+     *) DETECTED_CIDR=$src ;;
+  esac
+  return 0
+}
+
+# --- target arithmetic -------------------------------------------------------
+# arp-scan sweeps the whole local subnet, so its results have to be clipped to
+# the requested target or a narrow range would return hosts outside it.
+ip2int() { local a b c d; IFS=. read -r a b c d <<<"$1"; printf '%d' $(( (a<<24) | (b<<16) | (c<<8) | d )); }
+int2ip() { local n=$1; printf '%d.%d.%d.%d' $(( (n>>24) & 255 )) $(( (n>>16) & 255 )) $(( (n>>8) & 255 )) $(( n & 255 )); }
+
+# Sets T_LO / T_HI (inclusive, as 32-bit integers) from the parsed target.
+target_range() {
+  local t=$1 base bits n
+  T_LO=0; T_HI=0
+  if [[ $t == */* ]]; then
+    base=${t%%/*}; bits=${t##*/}
+    n=$(ip2int "$base")
+    if ((bits == 0)); then T_LO=0; T_HI=4294967295
+    else
+      local mask=$(( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+      T_LO=$(( n & mask )); T_HI=$(( T_LO | (~mask & 0xFFFFFFFF) ))
+    fi
+  elif [[ $t == *-* ]]; then
+    local lo=${t%%-*} hi=${t##*-}
+    T_LO=$(ip2int "$lo")
+    if [[ $hi == *.* ]]; then T_HI=$(ip2int "$hi")
+    else T_HI=$(( (T_LO & 0xFFFFFF00) | (hi & 255) )); fi
+    ((T_HI < T_LO)) && T_HI=$T_LO
+  else
+    T_LO=$(ip2int "$t"); T_HI=$T_LO
+  fi
+  return 0
+}
+
+# Accept CIDR / hyphen range / IP / hostname. Hostnames are resolved here
+# because the sweep runs with -n (no DNS) for speed.
+validate_target() {
+  local t=$1 o='(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])'
+  if [[ $t =~ ^$o\.$o\.$o\.$o(/([0-9]|[12][0-9]|3[0-2]))?$ ]]; then printf '%s' "$t"; return; fi
+  if [[ $t =~ ^$o\.$o\.$o\.$o-[0-9]{1,3}$ ]];                 then printf '%s' "$t"; return; fi
+  if [[ $t =~ ^$o\.$o\.$o\.[0-9]{1,3}-[0-9]{1,3}$ ]];          then printf '%s' "$t"; return; fi
+  local ip
+  ip=$(getent ahostsv4 "$t" 2>/dev/null | awk 'NR==1{print $1}') || true
+  [[ -n $ip ]] && { warn "resolved $t -> $ip"; printf '%s' "$ip"; return; }
+  die "cannot parse or resolve target: $t"
+}
+
+# ----------------------------------------------------------------- scan engine
+# gum spin wraps each stage. The work is handed to `bash -c` so its output can
+# be redirected to a file - capturing a spinner's stdout is unreliable.
+# Runs a stage, writing its stdout to $out. gum's spinner draws to the terminal
+# while --show-output lets the command's own stdout through to the redirect.
+spin() {
+  local title=$1 out=$2; shift 2
+  local pid
+  if ((QUIET)) || [[ ! -t 1 ]] || ! have gum; then
+    "$@" >"$out" 2>/dev/null &
+  else
+    gum spin --spinner dot --title "$title" --show-output -- "$@" >"$out" 2>/dev/null &
+  fi
+  pid=$!
+  # `wait` is interruptible, so INT/TERM/HUP are handled the moment they arrive
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
+
+# nmap -sn, unprivileged. Parses:
+#   Nmap scan report for 192.168.10.1
+#   Host is up (0.0040s latency).
+sweep_nmap() {
+  spin "sweeping $TARGET" "$TMP/nmap.out" \
+    nmap -sn -n --min-parallelism 64 "$TARGET"
+  awk '
+    /^Nmap scan report for/ { ip=$NF; lat="" }
+    /^Host is up/           { lat=$4; gsub(/[()s]/,"",lat);
+                              if (ip!="") { print ip"\t"lat; ip="" } }
+  ' "$TMP/nmap.out" >"$TMP/up.tsv"
+}
+
+# fping fallback when nmap is absent. -a lists only reachable hosts, -e adds
+# the round trip as "192.168.10.1 (3.45 ms)". fping exits non-zero whenever any
+# host is unreachable, which is the normal case for a sweep, hence `|| true`.
+# Latency is divided by 1000 so up.tsv is always in seconds, as nmap reports it.
+sweep_fping() {
+  local spec=$TARGET
+  [[ $spec == *-* || $spec == */* ]] && spec="-g $spec"
+  # shellcheck disable=SC2086  # $spec may be "-g <range>", two words on purpose
+  spin "sweeping $TARGET (fping)" "$TMP/fping.out" fping -a -e $spec
+  awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {
+         lat=$2; gsub(/[()]/,"",lat)
+         if (lat ~ /^[0-9.]+$/) printf "%s\t%.6f\n", $1, lat/1000
+         else print $1"\t"
+       }' "$TMP/fping.out" >"$TMP/up.tsv"
+}
+
+# arp-scan gives MACs and finds hosts that ignore ICMP entirely, so its
+# results are unioned into the host list rather than only annotating it.
+# Runs unprivileged via cap_net_raw; any failure is non-fatal.
+sweep_arp() {
+  : >"$TMP/arp.tsv"
+  have arp-scan || return 0
+  # Scan exactly the requested range when it is small enough to enumerate;
+  # arp-scan wants a full "start-end" pair, not nmap's "192.168.10.1-50" form.
+  local span=$(( T_HI - T_LO + 1 )) spec
+  local args=(--retry=2 --timeout=200)
+  if ((span > 0 && span <= 4096)); then
+    spec="$(int2ip "$T_LO")-$(int2ip "$T_HI")"
+    args+=("$spec")
+  else
+    args+=(--localnet)
+  fi
+  [[ -n $IFACE ]] && args=(-I "$IFACE" "${args[@]}")
+  spin "reading ARP table" "$TMP/arp.out" arp-scan "${args[@]}"
+  if ! grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$TMP/arp.out" 2>/dev/null; then
+    warn "arp-scan returned nothing - MAC and vendor columns unavailable"
+    return 0
+  fi
+  awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\t/ {print $1"\t"$2}' "$TMP/arp.out" >"$TMP/arp.tsv"
+  add_self_mac
+}
+
+# arp-scan never ARPs for the host it runs on, so this machine would show an
+# empty MAC and vendor. Read them straight out of sysfs instead.
+add_self_mac() {
+  local mac
+  [[ -n ${SELF_IP:-} && -n ${IFACE:-} ]] || return 0
+  [[ -r /sys/class/net/$IFACE/address ]] || return 0
+  grep -q "^$SELF_IP	" "$TMP/arp.tsv" 2>/dev/null && return 0
+  mac=$(<"/sys/class/net/$IFACE/address")
+  [[ -n $mac ]] && printf '%s\t%s\n' "$SELF_IP" "$mac" >>"$TMP/arp.tsv"
+  return 0
+}
+
+# Reverse DNS, bounded to $JOBS concurrent lookups. Each result goes to its own
+# file so parallel writers cannot interleave. getent exits non-zero when a host
+# has no PTR record, which would abort the script under `set -e`.
+resolve_rdns() {
+  mkdir -p "$TMP/rdns"
+  local ip n=0
+  while IFS= read -r ip; do
+    [[ -z $ip ]] && continue
+    {
+      h=$(timeout 2 getent hosts "$ip" 2>/dev/null | awk 'NR==1{print $2}') || true
+      printf '%s\t%s\n' "$ip" "${h:-}" >"$TMP/rdns/$ip"
+    } &
+    n=$((n + 1))
+    if ((n % JOBS == 0)); then wait; fi
+  done < <(cut -f1 "$TMP/all.txt")
+  wait
+  cat "$TMP"/rdns/* 2>/dev/null >"$TMP/rdns.tsv" || : >"$TMP/rdns.tsv"
+}
+
+# Resolve every needed OUI in one pass over the 52k-line database instead of
+# grepping once per host. arp-scan's own vendor file is far staler than nmap's.
+resolve_vendors() {
+  : >"$TMP/vendor.tsv"
+  [[ -s $TMP/arp.tsv && -r $OUI_DB ]] || return 0
+  cut -f2 "$TMP/arp.tsv" | tr -d ':' | tr 'a-f' 'A-F' | cut -c1-6 \
+    | sort -u >"$TMP/prefixes.txt"
+  [[ -s $TMP/prefixes.txt ]] || return 0
+  awk 'NR==FNR { need[$1]; next }
+       /^[0-9A-Fa-f]{6}[ \t]/ {
+         p = toupper($1)
+         if (p in need) { v = substr($0, length($1) + 2); print p "\t" v }
+       }' "$TMP/prefixes.txt" "$OUI_DB" >"$TMP/vendor.tsv" || true
+}
+
+# Trim corporate boilerplate: vendor strings run up to 96 characters and would
+# otherwise be truncated to uselessness in the list column.
+tidy_vendor() {
+  sed -E 's/,? ?\((R|TM)\)//Ig
+          s/,? (Inc|Corp|Corporation|Co|Company|Ltd|Limited|GmbH|B\.V|N\.V|S\.A|S\.L|PTE|LLC|LLP|AB|AG|SAS|A\/S|Oy|KG|PLC)\.?,?//Ig
+          s/ Technolog(y|ies)//Ig
+          s/ Electronics?( Co)?//Ig
+          s/ Communications?//Ig
+          s/ (International|Holdings?|Group|Industrial|Industries|Enterprise)//Ig
+          s/  +/ /g
+          s/^[ ,]+|[ ,]+$//g'
+}
+
+# ------------------------------------------------------------- data assembly
+# rows.tsv: ip \t host \t mac \t vendor \t latency_ms \t type \t sources
+build_rows() {
+  # Union of both discovery sources: arp-scan regularly sees hosts that drop
+  # ICMP and never appear in the nmap sweep.
+  {
+    cut -f1 "$TMP/up.tsv"
+    [[ -s $TMP/arp.tsv ]] && cut -f1 "$TMP/arp.tsv"
+  } | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u \
+    | awk -v lo="$T_LO" -v hi="$T_HI" '
+        { split($1, o, ".")
+          n = o[1]*16777216 + o[2]*65536 + o[3]*256 + o[4]
+          if (n >= lo && n <= hi) print }' >"$TMP/all.txt" || true
+  [[ -s $TMP/all.txt ]] || { : >"$TMP/rows.tsv"; return 0; }
+
+  resolve_rdns
+  resolve_vendors
+
+  awk -F'\t' -v self="$SELF_IP" -v engine="${ENGINE:-nmap}" '
+    FILENAME ~ /up\.tsv$/     { lat[$1] = $2; next }
+    FILENAME ~ /arp\.tsv$/    { mac[$1] = $2; next }
+    FILENAME ~ /rdns\.tsv$/   { if ($2 != "") host[$1] = $2; next }
+    FILENAME ~ /vendor\.tsv$/ { ven[$1] = $2; next }
+    FILENAME ~ /all\.txt$/ {
+      ip = $1
+      m = (ip in mac) ? mac[ip] : "-"
+      v = "-"
+      if (m != "-") {
+        p = toupper(m); gsub(/:/, "", p); p = substr(p, 1, 6)
+        # bit 0x02 of the first octet marks a locally administered address:
+        # a randomised privacy MAC, which has no real vendor to look up.
+        if (and(strtonum("0x" substr(p, 1, 2)), 2)) v = "(randomized)"
+        else if (p in ven) v = ven[p]
+      }
+      src = ""
+      if (ip in lat) src = engine
+      if (ip in mac) src = (src == "" ? "arp" : src "+arp")
+      ms = (ip in lat && lat[ip] != "") ? sprintf("%.1f", lat[ip] * 1000) : "-"
+      h  = (ip in host) ? host[ip] : "-"
+      if (src == "") src = "-"
+      printf "%s\t%s\t%s\t%s\t%s\t%s\n", ip, h, m, v, ms, src
+    }
+  ' "$TMP/up.tsv" "$TMP/arp.tsv" "$TMP/rdns.tsv" "$TMP/vendor.tsv" "$TMP/all.txt" \
+    >"$TMP/raw.tsv"
+
+  # Tidy vendors, classify, then sort numerically by octet (a lexical sort puts
+  # .10 before .9). The sort key is built, used, and dropped.
+  local ip host mac vendor ms type src
+  : >"$TMP/keyed.tsv"
+  while IFS=$'\t' read -r ip host mac vendor ms src; do
+    [[ -n $vendor && $vendor != "-" && $vendor != "(randomized)" ]] \
+      && vendor=$(printf '%s' "$vendor" | tidy_vendor)
+    [[ -z $vendor ]] && vendor="-"
+    type=$(type_for "$vendor" "$mac" "$ip")
+    printf '%03d%03d%03d%03d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${ip%%.*}" "$(cut -d. -f2 <<<"$ip")" "$(cut -d. -f3 <<<"$ip")" \
+      "${ip##*.}" "$ip" "$host" "$mac" "$vendor" "$ms" "$type" "$src" \
+      >>"$TMP/keyed.tsv"
+  done <"$TMP/raw.tsv"
+  sort -k1,1 "$TMP/keyed.tsv" | cut -f2- >"$TMP/rows.tsv"
+}
+
+# ------------------------------------------------------------------ rendering
+# One awk pass builds every display line. gawk's length() counts characters,
+# so padding stays correct even with multi-byte glyphs in vendor strings.
+render_list() {
+  local namew width
+  # LIST_W is the usable width of fzf's list section, set by run_picker. The
+  # fixed columns are icon(2) + ip(15) + gap(2) + latency(9) = 28.
+  width=${LIST_W:-$(( $(tput cols 2>/dev/null || echo 80) - 6 ))}
+  namew=$(( width - 28 ))
+  ((namew < 8))  && namew=8
+  ((namew > 38)) && namew=38
+  awk -F'\t' -v B="$B" -v D="$D" -v R="$R" -v C="$C" \
+      -v self="$SELF_IP" -v icons="$ICONS" -v nw="$namew" \
+      -v i_router="$ICO_ROUTER" -v i_phone="$ICO_PHONE" -v i_host="$ICO_HOST" \
+      -v i_self="$ICO_LAPTOP" -v i_print="$ICO_PRINTER" -v i_disp="$ICO_SCREEN" \
+      -v i_srv="$ICO_SERVER" -v ell="\xe2\x80\xa6" '
+    BEGIN {
+      ic["router"]=i_router; ic["phone"]=i_phone;  ic["host"]=i_host
+      ic["self"]=i_self;     ic["printer"]=i_print; ic["display"]=i_disp
+      ic["server"]=i_srv
+    }
+    function trunc(s, n) { return (length(s) > n) ? substr(s, 1, n - 1) ell : s }
+    function pad(s, n)   { s = trunc(s, n); while (length(s) < n) s = s " "; return s }
+    function lpad(s, n)  { while (length(s) < n) s = " " s; return s }
+    {
+      ip = $1; host = $2; ven = $4; ms = $5; type = $6
+      name = (host != "-" && host != "") ? host : ((ven != "-") ? ven : "-")
+      ipcol = (ip == self) ? C : B
+      glyph = ""
+      if (icons == 1) glyph = ((type in ic) ? ic[type] : i_host) " "
+      # rows.tsv keeps full precision for exports; the list rounds for legibility
+      if (ms == "-" || ms == "") lat = "-"
+      else if (ms + 0 < 1)       lat = "<1ms"
+      else                       lat = sprintf("%dms", ms + 0.5)
+      printf "%s%s%s%s  %s%s%s%s\n", glyph, ipcol, pad(ip, 15), R,
+             pad(name, nw), D, lpad(lat, 9), R
+    }
+  ' "$TMP/rows.tsv"
+}
+
+# Every line in the picker contains exactly one IPv4 address (MACs use colons),
+# so the actions recover their target by matching it out of the display line.
+ips_from() { grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u; }
+
+# Latency for the detail pane, matching how the list rounds it.
+fmt_rtt() {
+  local ms=$1
+  [[ -z $ms || $ms == "-" ]] && { printf '%s-%s' "$D" "$R"; return; }
+  if awk -v m="$ms" 'BEGIN{exit !(m+0 < 1)}'; then printf '%s<1ms%s' "$Y" "$R"
+  else printf '%s%dms%s' "$Y" "$(awk -v m="$ms" 'BEGIN{printf "%d", m+0.5}')" "$R"; fi
+}
+
+# --------------------------------------------------------------- detail pane
+# Invoked by fzf as a subprocess, so it re-reads rows.tsv from $OIPS_TMP.
+preview_host() {
+  local want=$1 ip host mac vendor ms type src
+  local file=${OIPS_TMP:-$TMP}/rows.tsv
+  [[ -r $file ]] || return 0
+  while IFS=$'\t' read -r ip host mac vendor ms type src; do
+    [[ $ip == "$want" ]] || continue
+    local glyph=""
+    ((ICONS)) && glyph="$(icon_for "$type") "
+    printf '\n %s%s%s%s%s\n' "$glyph" "$B" "$ip" "$R" \
+      "$([[ $ip == "$SELF_IP" ]] && printf ' %s(this machine)%s' "$C" "$R")"
+    printf ' %s%s%s\n\n' "$D" "────────────────────────────" "$R"
+    printf ' %shost%s    %s\n'   "$D" "$R" "${host:--}"
+    printf ' %smac%s     %s\n'   "$D" "$R" "${mac:--}"
+    printf ' %svendor%s  %s\n'   "$D" "$R" "${vendor:--}"
+    # the device class is a guess from the OUI, except for this machine
+    if [[ $type == self ]]; then
+      printf ' %stype%s    this machine\n' "$D" "$R"
+    else
+      printf ' %stype%s    %s %s(inferred)%s\n' "$D" "$R" "$type" "$D" "$R"
+    fi
+    printf ' %srtt%s     %s\n' "$D" "$R" "$(fmt_rtt "$ms")"
+    printf ' %ssource%s  %s\n'   "$D" "$R" "${src:--}"
+    local pf=${OIPS_TMP:-$TMP}/ports.$ip
+    printf '\n %sports%s   ' "$D" "$R"
+    if [[ -r $pf ]]; then printf '\n'; sed 's/^/   /' "$pf"
+    else printf '%sctrl-p to probe%s\n' "$D" "$R"; fi
+    return 0
+  done <"$file"
+}
+
+# ------------------------------------------------------------------ port scan
+probe_ports() {
+  local ip=$1
+  local out=${OIPS_TMP:-$TMP}/ports.$ip
+  have nmap || { printf 'nmap not available\n'; return 0; }
+  # Only open / open|filtered ports are kept - a wall of "closed" rows tells the
+  # reader nothing and would push the useful lines out of the preview pane.
+  nmap -Pn -T4 --top-ports "$TOP_PORTS" "$ip" 2>/dev/null \
+    | awk '/^[0-9]+\/(tcp|udp)/ && $2 ~ /^open/ {printf "%-9s %-14s %s\n", $1, $3, $2}' \
+    >"$out" || true
+  [[ -s $out ]] || printf 'none open in top %s\n' "$TOP_PORTS" >"$out"
+  cat "$out"
+}
+
+# --------------------------------------------------------------------- export
+export_csv() {
+  local out=$1
+  # "-" is the internal placeholder for "unknown"; exports emit an empty cell
+  # so spreadsheets and numeric parsers are not fed a bogus value.
+  { printf 'ip,hostname,mac,vendor,latency_ms,type,sources\n'
+    awk -F'\t' 'BEGIN{OFS=","}
+      function blank(s){ return (s == "-") ? "" : s }
+      function q(s){ s = blank(s); gsub(/"/,"\"\"",s); return "\"" s "\"" }
+      {print q($1),q($2),q($3),q($4),q($5),q($6),q($7)}' "$TMP/rows.tsv"
+  } >"$out"
+  # count from the source, never by re-reading $out: it may be a pipe such as
+  # /dev/stdout, and reading that back would block forever.
+  warn "wrote $(wc -l <"$TMP/rows.tsv" | tr -d ' ') hosts to $out"
+}
+
+export_json() {
+  local out=$1
+  if have jq; then
+    awk -F'\t' '{print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7}' "$TMP/rows.tsv" \
+      | jq -R -s 'def blank: if . == "-" or . == "" then null else . end;
+          split("\n") | map(select(length>0) | split("\t") | {
+            ip: .[0], hostname: (.[1]|blank), mac: (.[2]|blank),
+            vendor: (.[3]|blank),
+            latency_ms: (.[4] | blank | if . == null then null else tonumber end),
+            type: .[5], sources: (.[6]|blank) })' >"$out"
+  else
+    awk -F'\t' '
+      function esc(s){ if (s == "-") return ""
+                       gsub(/\\/,"\\\\",s); gsub(/"/,"\\\"",s); return s }
+      BEGIN{ print "["; n=0 }
+      { if (n++) print ","
+        printf "  {\"ip\":\"%s\",\"hostname\":\"%s\",\"mac\":\"%s\",\"vendor\":\"%s\",",
+               esc($1), esc($2), esc($3), esc($4)
+        printf "\"latency_ms\":%s,\"type\":\"%s\",\"sources\":\"%s\"}",
+               (($5=="" || $5=="-") ? "null" : $5), esc($6), esc($7) }
+      END{ print ""; print "]" }' "$TMP/rows.tsv" >"$out"
+  fi
+  warn "wrote $out"
+}
+
+# ------------------------------------------------------------------- picker
+# Actions that stay inside the picker (copy/open/probe) run as execute-silent
+# re-invocations of this script; the two that must tear the UI down (rescan,
+# export) come back through --expect so the caller can act on them.
+run_picker() {
+  local header binds=() key label=" omarchy-ipscan "
+  local count total elapsed
+  count=$(wc -l <"$TMP/rows.tsv" | tr -d ' ')
+  total=${SCANNED:-?}; elapsed=${ELAPSED:-?}
+
+  # The header sits inside the list pane, so it is kept to a single short line;
+  # the keybinds go in the footer, which spans the full window width.
+  header=$(printf '%s%s · %s · %s%s up%s%s/%s · %ss%s' \
+    "$D" "$TARGET" "${IFACE:-?}" "$G" "$count" "$R" "$D" "$total" "$elapsed" "$R")
+  # fzf scopes the footer to the list section, not the whole window, so the hint
+  # line is chosen to fit the width actually available and never truncates.
+  local footer cols listw pvw
+  cols=$(tput cols 2>/dev/null || echo 80)
+  # Side-by-side needs room for both panes; below that the detail pane moves
+  # under the list so neither gets squeezed into uselessness.
+  if ((cols >= 100)); then
+    pvw='right,44%,border-left'
+    listw=$(( cols * 56 / 100 - 6 ))
+  else
+    pvw='down,45%,border-top'
+    listw=$(( cols - 6 ))
+  fi
+  LIST_W=$listw
+  local f1='↵ ssh   ^y copy   ^o http   ^p ports   ^r rescan   ^e export   esc quit'
+  local f2='↵ ssh  ^y copy  ^o http  ^p ports  ^r rescan  ^e export'
+  local f3='↵ ssh  ^y copy  ^p ports  ^r rescan'
+  local plain=$f3
+  if   (( ${#f1} <= listw )); then plain=$f1
+  elif (( ${#f2} <= listw )); then plain=$f2
+  fi
+  # embolden the key tokens, leave their labels plain
+  footer=$(printf '%s' "$plain" \
+    | sed -E "s/(\^[a-z]|↵|esc)/$(printf '\033[1m')\1$(printf '\033[0m')/g")
+
+  ((ICONS)) && label=" $ICO_APP omarchy-ipscan "
+
+  export OIPS_TMP=$TMP OIPS_SELF_IP=$SELF_IP OIPS_ICONS=$ICONS
+
+  binds+=(--bind "ctrl-y:execute-silent(printf '%s\n' {+} | '$SELF' --__copy)+bell")
+  binds+=(--bind "ctrl-o:execute-silent('$SELF' --__open {})")
+  binds+=(--bind "ctrl-p:change-preview-label( probing… )+execute-silent('$SELF' --__ports {})+change-preview-label()+refresh-preview")
+  binds+=(--bind "ctrl-a:toggle-all" --bind "?:toggle-preview")
+
+  render_list | fzf \
+    --ansi --multi --reverse --cycle \
+    --border=rounded \
+    --border-label="$label" --border-label-pos=2 \
+    --header="$header" --header-first \
+    --footer="$footer" \
+    --prompt='filter ▸ ' --pointer='▸' --marker='✓' \
+    --preview="'$SELF' --__preview {}" \
+    --preview-window="$pvw" \
+    --color='border:dim,label:bold,header:regular,prompt:bold,pointer:cyan,marker:cyan,gutter:-1' \
+    "${binds[@]}" \
+    --expect=ctrl-r,ctrl-e \
+    >"$TMP/pick.out" || true
+
+  key=$(head -1 "$TMP/pick.out" 2>/dev/null || true)
+  printf '%s' "$key"
+}
+
+# ------------------------------------------------------------------ actions
+action_ssh() {
+  local ip=$1
+  have ssh || { warn "ssh not installed"; return; }
+  printf '%s→ ssh %s%s\n' "$D" "$ip" "$R"
+  ssh "$ip" || true
+}
+
+do_scan() {
+  local t0 t1
+  t0=$SECONDS
+  : >"$TMP/up.tsv"; : >"$TMP/arp.tsv"
+  if have nmap;  then ENGINE=nmap;  sweep_nmap
+  elif have fping; then ENGINE=fping; sweep_fping
+  else die "neither nmap nor fping found - cannot scan"
+  fi
+  sweep_arp
+  build_rows
+  t1=$SECONDS
+  ELAPSED=$((t1 - t0))
+  SCANNED=$(awk 'END{print NR}' "$TMP/nmap.out" 2>/dev/null || echo '?')
+  SCANNED=$(grep -oE '[0-9]+ IP addresses' "$TMP/nmap.out" 2>/dev/null \
+            | head -1 | grep -oE '^[0-9]+' || echo "${SCANNED}")
+  [[ -z $SCANNED ]] && SCANNED='?'
+  # A bare `[[ ]] &&` as the final statement would return 1 and, under set -e,
+  # abort the caller. Always leave this function successful.
+  return 0
+}
+
+interactive_export() {
+  local fmt file default
+  if have gum; then
+    fmt=$(gum choose --header="export format" CSV JSON) || return 0
+  else
+    read -r -p "format [csv/json]: " fmt || return 0
+  fi
+  [[ -z $fmt ]] && return 0
+  fmt=${fmt,,}
+  default="ipscan-$(date +%Y%m%d-%H%M%S).${fmt}"
+  if have gum; then
+    file=$(gum input --prompt "file ▸ " --value "$default") || return 0
+  else
+    read -r -p "file [$default]: " file || return 0
+  fi
+  [[ -z $file ]] && file=$default
+  case $fmt in
+    csv)  export_csv  "$file" ;;
+    json) export_json "$file" ;;
+    *)    warn "unknown format: $fmt"; return 0 ;;
+  esac
+  have notify-send && notify-send "omarchy-ipscan" "exported to $file" || true
+}
+
+# ---------------------------------------------------------------------- main
+main() {
+  SELF=$(realpath "$0" 2>/dev/null || printf '%s' "$0")
+  SELF_IP=${OIPS_SELF_IP:-}
+  ICONS=${OIPS_ICONS:-0}
+
+  # Re-invocations from inside fzf. Their stdout is a pipe, so colours are
+  # forced on here - setup_colors would otherwise strip them in the preview.
+  case ${1:-} in
+    --__preview|--__ports|--__copy|--__open)
+      B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
+      C=$'\033[36m'; G=$'\033[32m'; Y=$'\033[33m'; RD=$'\033[31m'
+      # only the pane-rendering subcommands need the scratch dir
+      TMP=${OIPS_TMP:-}
+      case $1 in --__preview|--__ports) [[ -n $TMP ]] || exit 0 ;; esac
+      local sub=$1; shift
+      # grep exits 1 when the line carries no IP, which set -e would treat as
+      # fatal; --__copy legitimately has no argument and reads stdin instead.
+      local ip; ip=$(printf '%s' "${1:-}" | ips_from | head -1 || true)
+      case $sub in
+        --__preview) [[ -n $ip ]] && preview_host "$ip" ;;
+        --__ports)   [[ -n $ip ]] && probe_ports "$ip" >/dev/null ;;
+        --__open)    [[ -n $ip ]] && have xdg-open && (xdg-open "http://$ip" >/dev/null 2>&1 &) ;;
+        --__copy)
+          local ips; ips=$(ips_from || true)
+          [[ -z $ips ]] && exit 0
+          if have wl-copy; then printf '%s\n' "$ips" | wl-copy
+          elif have xclip; then printf '%s\n' "$ips" | xclip -selection clipboard
+          fi ;;
+      esac
+      exit 0 ;;
+  esac
+
+  setup_colors
+  parse_args "$@"
+  [[ -t 1 ]] || QUIET=1
+  setup_tmp
+
+  detect_default || warn "no default route - pass a target explicitly"
+
+  if [[ -z $TARGET ]]; then
+    if ((QUIET)) || ! have gum || [[ ! -t 0 ]]; then
+      [[ -n ${DETECTED_CIDR:-} ]] || die "cannot auto-detect a subnet; pass a target"
+      TARGET=$DETECTED_CIDR
+    else
+      TARGET=$(gum input --prompt 'target ▸ ' \
+                 --value "${DETECTED_CIDR:-192.168.1.0/24}" \
+                 --placeholder 'CIDR, range, IP or hostname') || exit 130
+      [[ -z $TARGET ]] && exit 130
+    fi
+  fi
+  TARGET=$(validate_target "$TARGET")
+  target_range "$TARGET"
+
+  ICONS=0
+  have_nerdfont && ICONS=1
+  ((QUIET)) && ICONS=0
+
+  do_scan
+
+  if ((DO_PORTS)); then
+    local ip
+    while IFS=$'\t' read -r ip _; do
+      spin "probing $ip" bash -c 'true'
+      probe_ports "$ip" >/dev/null
+    done <"$TMP/rows.tsv"
+  fi
+
+  [[ -n $CSV_OUT  ]] && { export_csv  "$CSV_OUT";  }
+  [[ -n $JSON_OUT ]] && { export_json "$JSON_OUT"; }
+  [[ -n $CSV_OUT || -n $JSON_OUT ]] && exit 0
+
+  if ((QUIET)); then
+    awk -F'\t' '{printf "%s\t%s\t%s\n", $1, ($2==""?"-":$2), ($3==""?"-":$3)}' \
+      "$TMP/rows.tsv"
+    exit 0
+  fi
+
+  if [[ ! -s $TMP/rows.tsv ]]; then
+    warn "no hosts responded on $TARGET"
+    exit 1
+  fi
+
+  have fzf || { cat "$TMP/rows.tsv"; exit 0; }
+
+  local key sel
+  while :; do
+    key=$(run_picker)
+    mapfile -t sel < <(tail -n +2 "$TMP/pick.out" 2>/dev/null | ips_from)
+    case $key in
+      ctrl-r) do_scan; continue ;;
+      ctrl-e) interactive_export; continue ;;
+      *)
+        ((${#sel[@]})) || break
+        action_ssh "${sel[0]}"
+        continue ;;
+    esac
+  done
+}
+
+main "$@"

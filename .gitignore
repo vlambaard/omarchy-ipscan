@@ -1,0 +1,4 @@
+# scratch
+*.csv
+*.json
+!package.json
