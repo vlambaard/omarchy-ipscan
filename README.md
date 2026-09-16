@@ -41,6 +41,8 @@ it, grabbing its IP, or checking what it has open is. Typical uses:
 - Device-type inference (router / printer / phone / display / server) from the vendor.
 - Fuzzy filtering, multi-select, and a live detail pane.
 - On-demand port scan of the highlighted host.
+- A real progress bar during the sweep, and rescanning in place without
+  losing your filter or your place in the list.
 - CSV and JSON export, plus a pipe-friendly quiet mode.
 - Theme-aware: inherits your terminal's colours instead of hardcoding any.
 
@@ -120,6 +122,13 @@ omarchy-ipscan --csv hosts.csv            # headless export
 omarchy-ipscan -q | awk -F'\t' '$2!="-"'  # only hosts with a reverse-DNS name
 ```
 
+While the sweep runs you get a real progress percentage rather than an
+indeterminate spinner:
+
+```
+  sweeping 192.168.1.0/24  ━━━━━━━━━━━━━━━━━━━─────────  68%
+```
+
 With no argument the subnet is taken from the **default route** and offered as a
 prefilled prompt, so a bare invocation plus Enter does the right thing. Interfaces
 that are not on the default route — docker and libvirt bridges in particular — are
@@ -133,7 +142,7 @@ deliberately ignored.
 | `ctrl-y` | copy selected IP(s) to the clipboard  |
 | `ctrl-o` | open `http://<ip>` in the browser     |
 | `ctrl-p` | port-scan the host (top 20 ports)     |
-| `ctrl-r` | rescan the same target                |
+| `ctrl-r` | rescan in place (keeps your filter)   |
 | `ctrl-e` | export to CSV or JSON                 |
 | `tab`    | multi-select                          |
 | `ctrl-a` | select all                            |
@@ -237,6 +246,23 @@ output is plain whenever stdout is not a TTY.
 **Icons degrade.** Device glyphs are drawn from a single Nerd Font range (`nf-md`) so
 every glyph has the same display width and columns stay aligned. Without a Nerd Font
 they are dropped automatically; `--no-icons` forces that.
+
+**Results cannot stream, so progress does instead.** An obvious feature request
+is to show hosts as they are discovered. It is not possible with `nmap`: a ping
+sweep emits every result at once when it finishes — measured on a live /24, all
+rows arrive at 2.01s — and neither `stdbuf -oL` nor running it under a pty
+changes that, because it is how the scan works rather than an I/O buffering
+artifact. `arp-scan` behaves the same way. `fping` does stream, but takes ~10s
+for a /24 and misses hosts, so it is a poor basis for a live pass. What *does*
+stream is nmap's `--stats-every` output, which is where the progress bar comes
+from. Genuinely incremental results would mean doing ICMP in-process rather
+than shelling out.
+
+**Rescanning does not tear the picker down.** `ctrl-r` reloads the list inside
+`fzf`, so the typed filter, the cursor position and the window all survive. The
+header is rebuilt on fzf's `load` event rather than chained after `reload` —
+`reload` is asynchronous, so a chained action would refresh the counts before
+the new scan existed and leave them stale.
 
 **Cleanup is not best-effort.** Scratch files live in one `mktemp -d` removed by an
 `EXIT` trap, and `INT`/`TERM`/`HUP`/`QUIT` reap the whole child tree — so Ctrl-C
