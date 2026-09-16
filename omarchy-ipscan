@@ -299,12 +299,46 @@ spin() {
   return 0
 }
 
+# Draws a determinate progress bar. Bold/dim only, so it inherits the theme.
+draw_bar() {
+  local pct=${1:-0} width=28 filled i bar="" rest=""
+  pct=${pct%%.*}
+  ((pct > 100)) && pct=100
+  ((pct < 0)) && pct=0
+  filled=$(( pct * width / 100 ))
+  for ((i = 0; i < filled; i++)); do bar+="━"; done
+  for ((i = filled; i < width; i++)); do rest+="─"; done
+  printf '\r  %ssweeping%s %s  %s%s%s%s%s%s %3d%%  ' \
+    "$D" "$R" "$TARGET" "$B" "$bar" "$R" "$D" "$rest" "$R" "$pct"
+}
+
 # nmap -sn, unprivileged. Parses:
 #   Nmap scan report for 192.168.10.1
 #   Host is up (0.0040s latency).
+#
+# nmap does not report hosts as it finds them - every result lands at once when
+# the sweep completes, and neither stdbuf nor a pty changes that. Its
+# --stats-every output *does* stream, so progress is real even though the rows
+# cannot be. The scan runs in the background and is polled, which also keeps
+# signal handling responsive.
 sweep_nmap() {
-  spin "sweeping $TARGET" "$TMP/nmap.out" \
-    nmap -sn -n --min-parallelism 64 "$TARGET"
+  if ((QUIET)) || [[ ! -t 1 ]]; then
+    nmap -sn -n --min-parallelism 64 "$TARGET" >"$TMP/nmap.out" 2>/dev/null || true
+  else
+    nmap -sn -n --min-parallelism 64 --stats-every 0.4s "$TARGET" \
+      >"$TMP/nmap.out" 2>/dev/null &
+    local pid=$! pct
+    printf '\033[?25l'
+    while kill -0 "$pid" 2>/dev/null; do
+      pct=$(grep -oE 'About [0-9.]+% done' "$TMP/nmap.out" 2>/dev/null \
+            | tail -1 | grep -oE '[0-9.]+' || true)
+      draw_bar "${pct:-0}"
+      sleep 0.15
+    done
+    wait "$pid" 2>/dev/null || true
+    draw_bar 100
+    printf '\033[?25h\r\033[2K'
+  fi
   awk '
     /^Nmap scan report for/ { ip=$NF; lat="" }
     /^Host is up/           { lat=$4; gsub(/[()s]/,"",lat);
@@ -620,14 +654,10 @@ export_json() {
 # export) come back through --expect so the caller can act on them.
 run_picker() {
   local header binds=() key label=" omarchy-ipscan "
-  local count total elapsed
-  count=$(wc -l <"$TMP/rows.tsv" | tr -d ' ')
-  total=${SCANNED:-?}; elapsed=${ELAPSED:-?}
 
   # The header sits inside the list pane, so it is kept to a single short line;
   # the keybinds go in the footer, which spans the full window width.
-  header=$(printf '%s%s · %s · %s%s up%s%s/%s · %ss%s' \
-    "$D" "$TARGET" "${IFACE:-?}" "$G" "$count" "$R" "$D" "$total" "$elapsed" "$R")
+  header=$(build_header)
   # fzf scopes the footer to the list section, not the whole window, so the hint
   # line is chosen to fit the width actually available and never truncates.
   local footer cols listw pvw
@@ -656,11 +686,18 @@ run_picker() {
   ((ICONS)) && label=" $ICO_APP omarchy-ipscan "
 
   export OIPS_TMP=$TMP OIPS_SELF_IP=$SELF_IP OIPS_ICONS=$ICONS
+  export OIPS_TARGET=$TARGET OIPS_IFACE=${IFACE:-} OIPS_LIST_W=$listw
 
   binds+=(--bind "ctrl-y:execute-silent(printf '%s\n' {+} | '$SELF' --__copy)+bell")
   binds+=(--bind "ctrl-o:execute-silent('$SELF' --__open {})")
   binds+=(--bind "ctrl-p:change-preview-label( probing… )+execute-silent('$SELF' --__ports {})+change-preview-label()+refresh-preview")
   binds+=(--bind "ctrl-a:toggle-all" --bind "?:toggle-preview")
+  # reload is asynchronous, so chaining transform-header after it would refresh
+  # the counts BEFORE the new scan exists and leave them stale. fzf's `load`
+  # event fires once the reloaded list has actually landed, which is the only
+  # correct moment to rebuild the header.
+  binds+=(--bind "ctrl-r:change-header( rescanning $TARGET…)+reload('$SELF' --__rescan 2>/dev/null)")
+  binds+=(--bind "load:transform-header('$SELF' --__header 2>/dev/null)")
 
   render_list | fzf \
     --ansi --multi --reverse --cycle \
@@ -673,7 +710,7 @@ run_picker() {
     --preview-window="$pvw" \
     --color='border:dim,label:bold,header:regular,prompt:bold,pointer:cyan,marker:cyan,gutter:-1' \
     "${binds[@]}" \
-    --expect=ctrl-r,ctrl-e \
+    --expect=ctrl-e \
     >"$TMP/pick.out" || true
 
   key=$(head -1 "$TMP/pick.out" 2>/dev/null || true)
@@ -704,9 +741,24 @@ do_scan() {
   SCANNED=$(grep -oE '[0-9]+ IP addresses' "$TMP/nmap.out" 2>/dev/null \
             | head -1 | grep -oE '^[0-9]+' || echo "${SCANNED}")
   [[ -z $SCANNED ]] && SCANNED='?'
+  # Persisted so --__header can rebuild the status line after an in-picker
+  # reload, where SCANNED/ELAPSED live in a subprocess that has since exited.
+  printf '%s\t%s\t%s\t%s\n' "$TARGET" "${IFACE:-?}" "$SCANNED" "$ELAPSED" \
+    >"$TMP/meta" 2>/dev/null || true
   # A bare `[[ ]] &&` as the final statement would return 1 and, under set -e,
   # abort the caller. Always leave this function successful.
   return 0
+}
+
+# The status line shown above the list. Rebuilt after every scan so the counts
+# never go stale when the picker reloads in place.
+build_header() {
+  local count target iface scanned elapsed
+  count=$(wc -l <"$TMP/rows.tsv" 2>/dev/null | tr -d ' ' || echo 0)
+  IFS=$'\t' read -r target iface scanned elapsed <"$TMP/meta" 2>/dev/null || true
+  printf '%s%s · %s · %s%s up%s%s/%s · %ss%s' \
+    "$D" "${target:-$TARGET}" "${iface:-?}" "$G" "${count:-0}" "$R" \
+    "$D" "${scanned:-?}" "${elapsed:-?}" "$R"
 }
 
 interactive_export() {
@@ -744,12 +796,12 @@ main() {
   # Re-invocations from inside fzf. Their stdout is a pipe, so colours are
   # forced on here - setup_colors would otherwise strip them in the preview.
   case ${1:-} in
-    --__preview|--__ports|--__copy|--__open)
+    --__preview|--__ports|--__copy|--__open|--__rescan|--__header)
       B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
       C=$'\033[36m'; G=$'\033[32m'; Y=$'\033[33m'; RD=$'\033[31m'
       # only the pane-rendering subcommands need the scratch dir
       TMP=${OIPS_TMP:-}
-      case $1 in --__preview|--__ports) [[ -n $TMP ]] || exit 0 ;; esac
+      case $1 in --__preview|--__ports|--__rescan|--__header) [[ -n $TMP ]] || exit 0 ;; esac
       local sub=$1; shift
       # grep exits 1 when the line carries no IP, which set -e would treat as
       # fatal; --__copy legitimately has no argument and reads stdin instead.
@@ -758,6 +810,16 @@ main() {
         --__preview) [[ -n $ip ]] && preview_host "$ip" ;;
         --__ports)   [[ -n $ip ]] && probe_ports "$ip" >/dev/null ;;
         --__open)    [[ -n $ip ]] && have xdg-open && (xdg-open "http://$ip" >/dev/null 2>&1 &) ;;
+        --__rescan)
+          # Re-runs the sweep for fzf's reload. stdout is a pipe here, so the
+          # progress bar and spinners disable themselves automatically.
+          TARGET=${OIPS_TARGET:?}; IFACE=${OIPS_IFACE:-}
+          LIST_W=${OIPS_LIST_W:-70}
+          target_range "$TARGET"
+          do_scan
+          render_list ;;
+        --__header)
+          TARGET=${OIPS_TARGET:-}; build_header ;;
         --__copy)
           local ips; ips=$(ips_from || true)
           [[ -z $ips ]] && exit 0
@@ -826,7 +888,6 @@ main() {
     key=$(run_picker)
     mapfile -t sel < <(tail -n +2 "$TMP/pick.out" 2>/dev/null | ips_from)
     case $key in
-      ctrl-r) do_scan; continue ;;
       ctrl-e) interactive_export; continue ;;
       *)
         ((${#sel[@]})) || break
